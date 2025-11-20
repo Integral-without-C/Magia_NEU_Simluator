@@ -1,0 +1,82 @@
+总体说明
+
+功能：从实验谱（d‑I）中提取峰位并与数据库（txt 文件）中的理论谱线逐条比对，给出匹配分数并绘图展示。
+并行：使用 ProcessPoolExecutor 对每个数据库文件并行执行精匹配（fine_match），使用了可序列化的顶层包装函数 fine_match_worker。
+函数说明（按文件顺序）
+
+fine_match_worker(args)
+作用：顶层可 picklable 的包装器，用于进程池中调用。
+参数：args 是元组 (db_path, exp_sorted, n, weights, rel_tol, abs_tol)。
+返回：直接返回 fine_match(...) 的返回值。
+目的：避免在 Windows 下将 lambda 或局部函数传入进程池导致不可序列化错误。
+find_matches_peakwise(exp_peaks, db_peaks, rel_tol=0.001, abs_tol=0.005)
+作用：基于 d 值范围逐峰匹配实验峰与数据库峰，返回匹配对与未匹配的强峰提示。
+主要参数：
+exp_peaks / db_peaks：按 d 排序的列表 [(d, intensity), ...]。
+rel_tol：相对容差（比例）；匹配容差 = max(d * rel_tol, abs_tol)。
+abs_tol：绝对容差（单位 d）。
+返回：(matched, db_unmatched_strong, exp_unmatched_strong)
+matched: [(d_exp,i_exp,d_db,i_db,delta_d), ...]
+db_unmatched_strong、exp_unmatched_strong：各取前若干未匹配的强峰以便诊断。
+load_database_txt(txt_path, top_k_peaks=None)
+作用：从单个数据库 txt 文件读取峰位与强度，归一化并返回峰列表与字典。
+主要参数：
+txt_path：数据库文件路径（文本格式，假定每行 d intensity）。
+top_k_peaks：可选，若指定则先按强度取前 top_k_peaks 再按 d 排序返回。
+返回：(peaks, peaks_dict)
+peaks：按 d 排序的 [(d,inten_norm), ...]
+peaks_dict：{d: inten_norm, ...} 便于快速查找
+plot_match(exp_d, exp_i, db_peaks, db_name, matched_pairs)
+作用：绘制实验谱与数据库谱线的对比图，并以不同颜色标记匹配点。
+参数说明：
+exp_d, exp_i：实验 d 数组与归一化强度数组。
+db_peaks：数据库峰列表 [(d,i), ...]（通常归一化后）。
+db_name：用于标题显示的数据库文件名。
+matched_pairs：匹配列表用于在图上标注。
+coarse_score(db_path, exp_top, rel_tol=0.01, abs_tol=0.01)
+作用：对单个数据库文件做快速粗筛分数（可选使用，当前程序已注释掉粗筛改为对全部文件精筛）。
+主要逻辑：
+读取数据库峰，先限制到实验 d 范围内；
+使用 find_matches_peakwise 计算匹配数与强度相似度之和作为粗筛分数。
+返回：(score, db_path) 便于按分数排序选择候选。
+fine_match(db_path, exp_sorted, n, weights, rel_tol=0.01, abs_tol=0.01)
+作用：对单个数据库文件进行精匹配并给出匹配分数与匹配对，是真正的评分逻辑核心。
+主要参数：
+db_path：数据库 txt 文件路径。
+exp_sorted：按强度排序的实验峰列表 [(d,i), ...]（通常前若干强峰用于匹配）。
+n：参与匹配的实验峰数量上限（只使用 exp_sorted[:n]）。
+weights：长度为 n 的权重数组，表示不同实验强峰在总分中的权重。
+rel_tol / abs_tol：匹配容差（同上）。
+评分要点：
+只考虑实验 d 范围内的数据库峰；
+对每个实验峰在数据库峰中寻找最佳匹配（考虑 delta、强度相似度、排名差异），累加加权得分；
+给匹配数量增加小额奖励；
+对数据库前三强峰若未被匹配按强度与权重做减分惩罚（实现未匹配三强峰的负贡献）。
+返回：(total_score, db_path, db_peaks, matched_pairs)
+main(exp_file, db_folder, top_n=100, rel_tol=0.05, abs_tol=0.05, use_background=False)
+作用：程序入口，完成以下步骤：
+使用 peaks_search2.extract_peaks 从实验文件提取峰（参数可控制是否去背底）。
+构造并行任务参数列表并对数据库文件并行执行 fine_match。
+汇总、按分数排序并输出 top_n 结果，同时用 plot_match 绘图。
+主要参数：
+exp_file：实验数据文件路径（d, intensity[, error] 三列或两列）。
+db_folder：包含数据库 txt 文件的文件夹。
+top_n：输出的排名数量（前 top_n 个）。
+rel_tol / abs_tol：用于 fine_match 的容差。
+use_background：是否在 extract_peaks 中启用去背底和平滑（传给 peaks_search2.extract_peaks）。
+并行参数：
+程序中使用 max_workers = min(os.cpu_count() or 6, 10) 作为进程数上限。建议根据机器调整：
+CPU 密集型任务：max_workers ≈ max(1, cpu_count-1)
+若内存有限或进程开销大，可进一步限制上限（如 <=8 或 <=12）。
+关于 peaks_search2.extract_peaks（外部函数）
+
+作用：从实验数据文件提取峰位与强度，并可选择对数据进行背景去除和平滑后寻峰。
+常用参数（根据文件中签名）：
+dat_filename：实验数据路径
+top_n：返回的峰数上限
+smooth_window、background_window：平滑与背景平滑窗口长度
+min_height、min_prominence、min_distance、min_width：find_peaks 的筛选参数
+threshold：基于归一化后的阈值过滤弱峰
+export_background、background_filename：是否导出背景数据
+use_background：是否启用背景去除（该程序中用来控制是否在寻峰前去背）
+返回值：通常包含 peaks、d、intensity 等，main 中按 peaks, d, intensity, *_ 解析。
