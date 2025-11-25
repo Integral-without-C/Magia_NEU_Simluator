@@ -1,5 +1,9 @@
 ##2025.11.18
 #输出格式修改为 d值 + 归一化强度
+#检测到重名文件会跳过生成，支持追加更新数据库
+'''
+PV函数仅适用于CW，对于飞行时间需要重新按照B-B峰型生成。
+'''
 
 #CWND_v1.3.py
 ## 1.增加批处理功能，可以一次处理多个 CIF 文件，并生成对应的模拟图和数据文件。
@@ -374,25 +378,21 @@ def simulate_pattern(G_star, point_group_R, all_atoms, lam, tth_min, tth_max, fw
         y_grid += I * pseudo_voigt(x_grid, tt, fwhm, eta)
     return peaks, x_grid, y_grid, hmax
 
-def save_outputs(out_base: Path, base_name: str, formula: str, sg: str, x: np.ndarray, y: np.ndarray, peaks, elements: List[str]):
-    out_dir_tif = out_base / 'tif'
-    out_dir_txt = out_base / 'txt'
-    out_dir_tif.mkdir(parents=True, exist_ok=True)
-    out_dir_txt.mkdir(parents=True, exist_ok=True)
+def save_outputs(out_base: Path, base_name: str, formula: str, sg: str, x: np.ndarray, y: np.ndarray, peaks, elements: List[str], lam: float):
+    # 不再创建任何子文件夹，仅在指定的输出目录直接写入 txt 文件
+    out_dir = Path(out_base)
+    if not out_dir.exists() or not out_dir.is_dir():
+        raise FileNotFoundError(f"输出目录不存在或不是目录: {out_dir}")
 
-    # 使用 CIF 文件名作为输出基名（保留空格，替换非法字符）
-    bad = '<>:"/\\|?*'
-    name = ''.join(('_' if ch in bad else ch) for ch in base_name).strip().strip('.')
+    # 使用已存在的 sanitize_filename 函数清理文件名
+    name = sanitize_filename(base_name)
 
-    tif_path = out_dir_tif / f"{name}.tif"
-    txt_path = out_dir_txt / f"{name}.txt"
+    txt_path = out_dir / f"{name}.txt"
 
-    # 防重名
-    idx = 1
-    while tif_path.exists() or txt_path.exists():
-        tif_path = out_dir_tif / f"{name}__{idx}.tif"
-        txt_path = out_dir_txt / f"{name}__{idx}.txt"
-        idx += 1
+    # 如果 txt 已存在则提示并跳过 txt 的生成
+    if txt_path.exists():
+        print(f"{name}在数据库中已存在")
+        return txt_path
 
     # 归一化强度
     intensities = [I for _, I, _, _ in peaks]
@@ -405,14 +405,12 @@ def save_outputs(out_base: Path, base_name: str, formula: str, sg: str, x: np.nd
         f.write(f"包含原子: {', '.join(elements)}\n")
         f.write("衍射峰位与峰强(d_Å, Normalized_Intensity, h, k, l, multiplicity):\n")
         for tt, I, (h, k, l), m in peaks:
-            # 由2θ反算d值
             theta = tt / 2
             theta_rad = np.deg2rad(theta)
-            d = 1.0 / (2 * np.sin(theta_rad) / 1.0) if np.sin(theta_rad) != 0 else 0.0  # lam=1.0用于d值计算
+            d = lam / (2 * np.sin(theta_rad)) if np.sin(theta_rad) != 0 else 0.0
             norm_I = I / max_intensity if max_intensity > 0 else 0.0
             f.write(f"{d:.6f}\t{norm_I:.14f}\t{h}\t{k}\t{l}\t{m}\n")
-
-    return tif_path, txt_path
+    return txt_path
 
 def process_single_cif(p: Path, out_base: Path, lam: float, tth_min: float, tth_max: float, fwhm: float, eta: float):
     try:
@@ -421,9 +419,9 @@ def process_single_cif(p: Path, out_base: Path, lam: float, tth_min: float, tth_
         peaks, x, y, hmax = simulate_pattern(G_star, info['point_group_R'], info['atoms_all'], lam, tth_min, tth_max, fwhm, eta)
         formula, elements = format_formula_from_counts(info['element_count'])
         sg = info['space_group'] or 'Unknown'
-        # 使用 CIF 文件名（不含扩展名）作为输出文件名
-        save_outputs(out_base, p.stem, formula, sg, x, y, peaks, elements)
-        return f"完成: {p.name} -> {p.stem}.tif / {p.stem}.txt", None
+        # 只输出 txt 到指定目录（save_outputs 已处理存在性检查）
+        txt_path = save_outputs(out_base, p.stem, formula, sg, x, y, peaks, elements, lam)
+        return f"完成: {p.name} -> {txt_path.name}", None
     except Exception as e:
         tb = traceback.format_exc()
         return None, (p, tb)
@@ -437,8 +435,13 @@ def run_batch(input_path: str, out_dir: str, lam: float, tth_min: float, tth_max
         return
 
     out_base = Path(out_dir)
+
+    # 不自动创建任何目录；要求用户指定的输出目录必须已存在
+    if not out_base.exists() or not out_base.is_dir():
+        print(f"输出目录不存在或不是目录，请先创建: {out_base}")
+        return
+
     error_log = out_base / 'errors.log'
-    error_log.parent.mkdir(parents=True, exist_ok=True)
     if error_log.exists():
         error_log.unlink()
 
@@ -457,7 +460,7 @@ def run_batch(input_path: str, out_dir: str, lam: float, tth_min: float, tth_max
                 with open(error_log, 'a', encoding='utf-8') as f:
                     f.write(f"File: {p}\n{tb}\n{'-'*80}\n")
 
-    print(f"完成。成功 {ok} 个，失败 {fail} 个。输出目录: {Path(out_dir).resolve()}")
+    print(f"完成。成功 {ok} 个，失败 {fail} 个。输出目录: {out_base.resolve()}")
     if fail > 0:
         print(f"错误详情见: {error_log}")
 
@@ -530,7 +533,7 @@ def main():
         lam = 1.5405
         tth_min, tth_max = 10.0, 120.0
         fwhm, eta = 0.05, 0.5
-        workers = 10  # GUI模式下默认10，可手动修改此处
+        workers = 8  # GUI模式下默认8，可手动修改此处
         run_batch(in_path, out_dir, lam, tth_min, tth_max, fwhm, eta, workers)
         return
 
